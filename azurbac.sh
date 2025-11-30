@@ -14,8 +14,8 @@
 #         roles/{roleName}/{principalName} -> symlink to entra ___guid.json
 #         resources/{resourceName}/___{guid}.json
 #           roles/{roleName}/{principalName} -> symlink to entra ___guid.json
-#       resource_types/{type}/{resourceName} -> symlink to resource ___guid.json
-#       resource_regions/{location}/{resourceName} -> symlink to resource ___guid.json
+#       resource_types/{type}/{resourceName} -> symlink to resource directory
+#       resource_regions/{location}/{resourceName} -> symlink to resource directory
 #
 
 set -euo pipefail
@@ -406,14 +406,16 @@ sync_resources() {
 
         # Create symlink in resource_types/{type}/
         ensure_dir "$types_dir/$safe_type"
-        # Path from: resource_types/{type}/ to resource_groups/{rg}/resources/{name}/___guid.json
+        # Path from: resource_types/{type}/ to resource_groups/{rg}/resources/{name}/
         # That's: up 2 (type -> resource_types -> sub_dir), then into resource_groups/...
-        ln -sf "../../resource_groups/$safe_rg_name/resources/$safe_res_name/___${res_guid}.json" \
+        # Symlink to directory (not json) so roles are visible when browsing via symlink
+        ln -sf "../../resource_groups/$safe_rg_name/resources/$safe_res_name" \
             "$types_dir/$safe_type/$safe_res_name" 2>/dev/null || true
 
         # Create symlink in resource_regions/{location}/
         ensure_dir "$regions_dir/$safe_location"
-        ln -sf "../../resource_groups/$safe_rg_name/resources/$safe_res_name/___${res_guid}.json" \
+        # Symlink to directory (not json) so roles are visible when browsing via symlink
+        ln -sf "../../resource_groups/$safe_rg_name/resources/$safe_res_name" \
             "$regions_dir/$safe_location/$safe_res_name" 2>/dev/null || true
     done
 }
