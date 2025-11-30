@@ -28,7 +28,7 @@ Now you can answer "who can delete prod?" with `find` instead of clicking throug
 | Script | Purpose |
 |--------|---------|
 | `azurbac.sh` | Dump Azure resources to filesystem |
-| `entraling.sh` | Trawl Entra ID for permissions audit |
+| `entrauling.sh` | Trawl Entra ID for permissions audit |
 
 ## Quick Start
 
@@ -42,15 +42,15 @@ git add azure/
 git commit -m "Azure permissions snapshot $(date +%Y-%m-%d)"
 
 # Interactive Entra audit (requires one-time setup)
-./entraling.sh setup && ./entraling.sh login
-./entraling.sh
+./entrauling.sh setup && ./entrauling.sh login
+./entrauling.sh
 ```
 
 ## Requirements
 
 - `az` CLI (logged in)
 - `jq`
-- `gum` (for entraling.sh interactive mode)
+- `gum` (for entrauling.sh interactive mode)
 
 ## Why?
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# entraling.sh - Entra ID Permissions Audit Tool (Entra Trawling)
+# entrauling.sh - Entra ID Permissions Audit Tool (Entra Trawling)
 # Audit permissions in Entra ID including PIM entitlements and PIM group entitlements
 #
 
@@ -225,11 +225,11 @@ get_graph_token() {
     GRAPH_TOKEN=$(get_cached_token 2>/dev/null) || {
         if refresh_access_token; then
             GRAPH_TOKEN=$(get_cached_token) || {
-                print_error "Not logged in. Please run 'entraling.sh login' first."
+                print_error "Not logged in. Please run 'entrauling.sh login' first."
                 return 1
             }
         else
-            print_error "Not logged in. Please run 'entraling.sh login' first."
+            print_error "Not logged in. Please run 'entrauling.sh login' first."
             return 1
         fi
     }
@@ -295,7 +295,7 @@ setup_app_registration() {
             print_success "Configuration saved!"
             echo ""
             echo "Next step: An admin needs to grant consent for the app permissions."
-            echo "Run: ${BOLD}entraling.sh grant-consent${NC}"
+            echo "Run: ${BOLD}entrauling.sh grant-consent${NC}"
             return 0
         fi
         print_info "Creating a new app registration..."
@@ -362,10 +362,10 @@ setup_app_registration() {
     echo ""
     print_warning "IMPORTANT: An admin must grant consent for the API permissions."
     echo ""
-    echo "Option 1: Run as admin: ${BOLD}entraling.sh grant-consent${NC}"
+    echo "Option 1: Run as admin: ${BOLD}entrauling.sh grant-consent${NC}"
     echo "Option 2: Go to Azure Portal -> App registrations -> $APP_NAME -> API permissions -> Grant admin consent"
     echo ""
-    echo "After consent is granted, run: ${BOLD}entraling.sh login${NC}"
+    echo "After consent is granted, run: ${BOLD}entrauling.sh login${NC}"
 }
 
 grant_admin_consent() {
@@ -378,7 +378,7 @@ grant_admin_consent() {
     config=$(get_app_config)
 
     if [[ -z "$config" ]]; then
-        print_error "App not configured. Run 'entraling.sh setup' first."
+        print_error "App not configured. Run 'entrauling.sh setup' first."
         return 1
     fi
 
@@ -444,7 +444,7 @@ grant_admin_consent() {
     fi
 
     echo ""
-    echo "You can now run: ${BOLD}entraling.sh login${NC}"
+    echo "You can now run: ${BOLD}entrauling.sh login${NC}"
 }
 
 do_device_code_login() {
@@ -454,7 +454,7 @@ do_device_code_login() {
     config=$(get_app_config)
 
     if [[ -z "$config" ]]; then
-        print_error "App not configured. Run 'entraling.sh setup' first."
+        print_error "App not configured. Run 'entrauling.sh setup' first."
         return 1
     fi
 
@@ -1840,7 +1840,7 @@ show_help() {
     gum style --foreground 252 "Entra ID Permissions Audit Tool"
     echo ""
     gum style --bold --foreground 33 "USAGE:"
-    echo "    entraling.sh [command]"
+    echo "    entrauling.sh [command]"
     echo ""
     gum style --bold --foreground 33 "SETUP (one-time):"
     echo "    setup           Create app registration for audit permissions"
@@ -1863,15 +1863,15 @@ show_help() {
     echo "    help, h         Show this help message"
     echo ""
     gum style --bold --foreground 33 "FIRST-TIME SETUP:"
-    echo "    1. entraling.sh setup         # Create app registration"
-    echo "    2. entraling.sh grant-consent # Grant permissions (requires admin)"
-    echo "    3. entraling.sh login         # Authenticate"
+    echo "    1. entrauling.sh setup         # Create app registration"
+    echo "    2. entrauling.sh grant-consent # Grant permissions (requires admin)"
+    echo "    3. entrauling.sh login         # Authenticate"
     echo ""
     gum style --bold --foreground 33 "EXAMPLES:"
-    echo "    entraling.sh              # Interactive mode"
-    echo "    entraling.sh all          # Full audit"
-    echo "    entraling.sh pim-roles    # Just PIM role eligibilities"
-    echo "    entraling.sh export       # Export to JSON"
+    echo "    entrauling.sh              # Interactive mode"
+    echo "    entrauling.sh all          # Full audit"
+    echo "    entrauling.sh pim-roles    # Just PIM role eligibilities"
+    echo "    entrauling.sh export       # Export to JSON"
 }
 
 #------------------------------------------------------------------------------

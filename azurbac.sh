@@ -563,7 +563,7 @@ sync_pim_groups() {
     if [[ -z "$token" ]]; then
         token=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv 2>/dev/null)
         if [[ -n "$token" ]]; then
-            print_warning "  Using az CLI token (may lack PIM permissions - run './entraling.sh login' for full PIM sync)"
+            print_warning "  Using az CLI token (may lack PIM permissions - run './entrauling.sh login' for full PIM sync)"
         fi
     fi
 

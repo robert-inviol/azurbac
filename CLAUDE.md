@@ -7,7 +7,7 @@ Tools for auditing Azure/Entra ID permissions, role assignments, and PIM (Privil
 ```
 azurbac/
 ├── azurbac.sh         # Sync Azure/Entra resources to filesystem for git tracking
-├── entraling.sh       # Interactive Entra ID permissions audit tool (Entra Trawling)
+├── entrauling.sh       # Interactive Entra ID permissions audit tool (Entra Trawling)
 ├── .devcontainer/     # Dev container config (Debian with az cli, gh cli, gum, jq)
 └── azure/             # Generated directory structure (created by azurbac.sh)
 ```
@@ -50,35 +50,35 @@ azure/
 │   └── resource_regions/{location}/{resourceName} -> symlink
 ```
 
-### entraling.sh
+### entrauling.sh
 
 Interactive audit tool for Entra ID permissions with PIM support. Name is a play on "Entra Trawling".
 
 **Setup (one-time):**
 ```bash
-./entraling.sh setup         # Create app registration
-./entraling.sh grant-consent # Grant permissions (requires admin)
-./entraling.sh login         # Authenticate
+./entrauling.sh setup         # Create app registration
+./entrauling.sh grant-consent # Grant permissions (requires admin)
+./entrauling.sh login         # Authenticate
 ```
 
 **Audit Commands:**
 ```bash
-./entraling.sh              # Interactive menu
-./entraling.sh all          # Full audit
-./entraling.sh roles        # Directory role assignments
-./entraling.sh pim-roles    # PIM role eligibilities
-./entraling.sh pim-active   # PIM active role assignments
-./entraling.sh pim-groups   # PIM group eligibilities
-./entraling.sh sp-rbac      # Service principal RBAC
-./entraling.sh apps         # Privileged Graph API permissions
-./entraling.sh export       # Export JSON report
+./entrauling.sh              # Interactive menu
+./entrauling.sh all          # Full audit
+./entrauling.sh roles        # Directory role assignments
+./entrauling.sh pim-roles    # PIM role eligibilities
+./entrauling.sh pim-active   # PIM active role assignments
+./entrauling.sh pim-groups   # PIM group eligibilities
+./entrauling.sh sp-rbac      # Service principal RBAC
+./entrauling.sh apps         # Privileged Graph API permissions
+./entrauling.sh export       # Export JSON report
 ```
 
 ## Dependencies
 
 - `az` - Azure CLI (must be logged in)
 - `jq` - JSON processor
-- `gum` - Terminal UI toolkit (entraling.sh only)
+- `gum` - Terminal UI toolkit (entrauling.sh only)
 
 ## Development
 
@@ -99,11 +99,11 @@ For `azurbac.sh`:
 
 **Run audit and export:**
 ```bash
-./entraling.sh all
-./entraling.sh export ./reports/audit.json
+./entrauling.sh all
+./entrauling.sh export ./reports/audit.json
 ```
 
 **Check specific PIM eligibilities:**
 ```bash
-./entraling.sh pim-groups
+./entrauling.sh pim-groups
 ```
