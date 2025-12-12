@@ -6,6 +6,7 @@
 #   azure/
 #     entra/
 #       users/{Guest|Member}/{displayName}/___{id}.json
+#         groups/{groupName} -> symlink to group ___guid.json
 #       groups/{displayName}/___{id}.json
 #         members/{memberName} -> symlink to user/group ___guid.json
 #       service_principals/{Application|ManagedIdentity|...}/{displayName}/___{id}.json
@@ -223,6 +224,66 @@ sync_groups() {
     done
 
     print_success "  Groups synced to $groups_dir"
+
+    # After syncing groups, create reverse symlinks (groups under users)
+    sync_user_group_memberships
+}
+
+sync_user_group_memberships() {
+    print_info "  Creating group memberships under users..."
+
+    local users_dir="$AZURE_DIR/entra/users"
+    local groups_dir="$AZURE_DIR/entra/groups"
+
+    # Skip if users haven't been synced yet
+    [[ ! -d "$users_dir" ]] && return
+
+    # Clean up existing groups directories under all users
+    find "$users_dir" -type d -name "groups" -exec rm -rf {} \; 2>/dev/null || true
+
+    # Iterate through each group's members directory
+    for group_dir in "$groups_dir"/*/; do
+        [[ ! -d "$group_dir" ]] && continue
+
+        local group_name=$(basename "$group_dir")
+        local members_dir="$group_dir/members"
+        local group_json=$(find "$group_dir" -maxdepth 1 -name "___*.json" 2>/dev/null | head -1)
+
+        [[ ! -d "$members_dir" ]] && continue
+        [[ -z "$group_json" ]] && continue
+
+        local group_id=$(basename "$group_json" | sed 's/___//; s/.json//')
+
+        # For each member symlink in the group
+        for member_link in "$members_dir"/*; do
+            [[ ! -L "$member_link" ]] && continue
+
+            local target=$(readlink "$member_link")
+
+            # Check if it points to a user (contains /users/)
+            if [[ "$target" == *"/users/"* ]]; then
+                local member_name=$(basename "$member_link")
+
+                # Extract user type from the symlink target path
+                # Target looks like: ../../../users/{type}/{name}/___guid.json
+                local user_type=$(echo "$target" | sed -n 's|.*/users/\([^/]*\)/.*|\1|p')
+
+                local user_dir="$users_dir/$user_type/$member_name"
+                if [[ -d "$user_dir" ]]; then
+                    local user_groups_dir="$user_dir/groups"
+                    ensure_dir "$user_groups_dir"
+
+                    # Create symlink from user's groups/ to group's ___guid.json
+                    # Path from: users/{type}/{name}/groups/ to groups/{groupName}/___guid.json
+                    # That's 4 levels up: groups -> name -> type -> users -> entra, then into groups/
+                    ln -sf "../../../../groups/$group_name/___${group_id}.json" \
+                        "$user_groups_dir/$group_name" 2>/dev/null || true
+                fi
+            fi
+        done
+    done
+
+    print_success "  User group memberships created"
 }
 
 sync_service_principals() {
