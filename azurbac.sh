@@ -7,9 +7,12 @@
 #     entra/
 #       users/{Guest|Member}/{displayName}/___{id}.json
 #         groups/{groupName} -> symlink to group ___guid.json
+#         roles/{roleName}/{scopeName} -> symlink to subscription/RG/resource ___*.json
 #       groups/{displayName}/___{id}.json
 #         members/{memberName} -> symlink to user/group ___guid.json
+#         roles/{roleName}/{scopeName} -> symlink to subscription/RG/resource ___*.json
 #       service_principals/{Application|ManagedIdentity|...}/{displayName}/___{id}.json
+#         roles/{roleName}/{scopeName} -> symlink to subscription/RG/resource ___*.json
 #     subscriptions/{name}/___{id}.json
 #       resource_groups/{name}/___{name}.json
 #         roles/{roleName}/{principalName} -> symlink to entra ___guid.json
@@ -595,6 +598,155 @@ sync_subscription_rbac() {
 }
 
 #------------------------------------------------------------------------------
+# Principal Roles Sync (reverse symlinks from principals to their role assignments)
+#------------------------------------------------------------------------------
+
+sync_principal_roles() {
+    print_info "Syncing principal role assignments..."
+
+    local subs_dir="$AZURE_DIR/subscriptions"
+    local entra_dir="$AZURE_DIR/entra"
+
+    [[ ! -d "$subs_dir" ]] && return
+    [[ ! -d "$entra_dir" ]] && return
+
+    # Clean up existing roles directories under all principals
+    print_info "  Cleaning existing principal roles..."
+    find "$entra_dir/users" -type d -name "roles" -exec rm -rf {} \; 2>/dev/null || true
+    find "$entra_dir/groups" -type d -name "roles" -exec rm -rf {} \; 2>/dev/null || true
+    find "$entra_dir/service_principals" -type d -name "roles" -exec rm -rf {} \; 2>/dev/null || true
+
+    # Iterate through all subscriptions
+    for sub_dir in "$subs_dir"/*/; do
+        [[ ! -d "$sub_dir" ]] && continue
+
+        local sub_name=$(basename "$sub_dir")
+
+        # Process subscription-level roles
+        process_roles_at_scope "$sub_dir" "subscriptions" "$sub_name" "" ""
+
+        # Process resource group roles
+        local rgs_dir="$sub_dir/resource_groups"
+        if [[ -d "$rgs_dir" ]]; then
+            for rg_dir in "$rgs_dir"/*/; do
+                [[ ! -d "$rg_dir" ]] && continue
+
+                local rg_name=$(basename "$rg_dir")
+
+                # Process RG-level roles
+                process_roles_at_scope "$rg_dir" "resource_groups" "$sub_name" "$rg_name" ""
+
+                # Process resource-level roles
+                local resources_dir="$rg_dir/resources"
+                if [[ -d "$resources_dir" ]]; then
+                    for res_dir in "$resources_dir"/*/; do
+                        [[ ! -d "$res_dir" ]] && continue
+
+                        local res_name=$(basename "$res_dir")
+
+                        # Process resource-level roles
+                        process_roles_at_scope "$res_dir" "resources" "$sub_name" "$rg_name" "$res_name"
+                    done
+                fi
+            done
+        fi
+    done
+
+    print_success "  Principal role assignments synced"
+}
+
+# Helper function to process roles at a specific scope and create reverse symlinks
+# Args: scope_dir, scope_type (subscriptions|resource_groups|resources), sub_name, rg_name, res_name
+process_roles_at_scope() {
+    local scope_dir="$1"
+    local scope_type="$2"
+    local sub_name="$3"
+    local rg_name="$4"
+    local res_name="$5"
+
+    local roles_dir="$scope_dir/roles"
+    [[ ! -d "$roles_dir" ]] && return
+
+    # Find the JSON file for this scope to link to
+    local scope_json=$(find "$scope_dir" -maxdepth 1 -name "___*.json" 2>/dev/null | head -1)
+    [[ -z "$scope_json" ]] && return
+    local scope_json_name=$(basename "$scope_json")
+
+    # Determine the scope name for the symlink
+    local scope_name=""
+    case "$scope_type" in
+        subscriptions) scope_name="$sub_name" ;;
+        resource_groups) scope_name="$rg_name" ;;
+        resources) scope_name="$res_name" ;;
+    esac
+
+    # Iterate through each role directory
+    for role_dir in "$roles_dir"/*/; do
+        [[ ! -d "$role_dir" ]] && continue
+
+        local role_name=$(basename "$role_dir")
+        local safe_role=$(sanitize_name "$role_name")
+
+        # Iterate through each principal symlink in the role
+        for principal_link in "$role_dir"/*; do
+            # Skip if not a symlink (could be orphaned JSON files)
+            [[ ! -L "$principal_link" ]] && continue
+
+            local principal_name=$(basename "$principal_link")
+            local target=$(readlink "$principal_link")
+
+            # Determine the principal type and directory from the symlink target
+            local principal_dir=""
+            local levels_up=""
+
+            if [[ "$target" == *"/users/"* ]]; then
+                local user_type=$(echo "$target" | sed -n 's|.*/users/\([^/]*\)/.*|\1|p')
+                principal_dir="$AZURE_DIR/entra/users/$user_type/$principal_name"
+                # From: entra/users/{type}/{name}/roles/{role}/ need to go up to azure/
+                # That's: {role} -> roles -> {name} -> {type} -> users -> entra -> azure = 6 levels
+                levels_up="../../../../../.."
+
+            elif [[ "$target" == *"/groups/"* ]]; then
+                principal_dir="$AZURE_DIR/entra/groups/$principal_name"
+                # From: entra/groups/{name}/roles/{role}/ to azure/
+                # That's: {role} -> roles -> {name} -> groups -> entra -> azure = 5 levels
+                levels_up="../../../../.."
+
+            elif [[ "$target" == *"/service_principals/"* ]]; then
+                local sp_type=$(echo "$target" | sed -n 's|.*/service_principals/\([^/]*\)/.*|\1|p')
+                principal_dir="$AZURE_DIR/entra/service_principals/$sp_type/$principal_name"
+                # From: entra/service_principals/{type}/{name}/roles/{role}/ to azure/
+                # That's: {role} -> roles -> {name} -> {type} -> service_principals -> entra -> azure = 6 levels
+                levels_up="../../../../../.."
+            fi
+
+            [[ -z "$principal_dir" ]] && continue
+            [[ ! -d "$principal_dir" ]] && continue
+
+            # Create roles/{roleName}/ under the principal
+            local principal_role_dir="$principal_dir/roles/$safe_role"
+            ensure_dir "$principal_role_dir"
+
+            # Create symlink: {scopeName} -> path to scope's ___*.json
+            local target_path=""
+            case "$scope_type" in
+                subscriptions)
+                    target_path="$levels_up/subscriptions/$sub_name/$scope_json_name"
+                    ;;
+                resource_groups)
+                    target_path="$levels_up/subscriptions/$sub_name/resource_groups/$rg_name/$scope_json_name"
+                    ;;
+                resources)
+                    target_path="$levels_up/subscriptions/$sub_name/resource_groups/$rg_name/resources/$res_name/$scope_json_name"
+                    ;;
+            esac
+
+            ln -sf "$target_path" "$principal_role_dir/$scope_name" 2>/dev/null || true
+        done
+    done
+}
+
+#------------------------------------------------------------------------------
 # PIM Sync
 #------------------------------------------------------------------------------
 
@@ -812,6 +964,7 @@ main() {
             [[ "$SYNC_SERVICE_PRINCIPALS" == "true" ]] && sync_service_principals
             [[ "$SYNC_SUBSCRIPTIONS" == "true" ]] && sync_subscriptions
             [[ "$SYNC_RBAC" == "true" ]] && sync_subscription_rbac
+            [[ "$SYNC_RBAC" == "true" ]] && sync_principal_roles
             sync_pim_groups
             ;;
         users)
@@ -841,6 +994,7 @@ main() {
             ;;
         rbac)
             sync_subscription_rbac
+            sync_principal_roles
             ;;
         pim)
             sync_pim_groups
