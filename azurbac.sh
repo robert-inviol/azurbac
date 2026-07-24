@@ -13,6 +13,11 @@
 #         roles/{roleName}/{scopeName} -> symlink to subscription/RG/resource ___*.json
 #       service_principals/{Application|ManagedIdentity|...}/{displayName}/___{id}.json
 #         roles/{roleName}/{scopeName} -> symlink to subscription/RG/resource ___*.json
+#       pim/
+#         groups/{groupName}/_eligibilities.json + _active.json
+#           eligible/{principalName} -> symlink to entra ___guid.json
+#         roles/{roleName}/_eligibilities.json + _active.json
+#           eligible/{principalName} -> symlink to entra ___guid.json
 #     subscriptions/{name}/___{id}.json
 #       resource_groups/{name}/___{name}.json
 #         roles/{roleName}/{principalName} -> symlink to entra ___guid.json
@@ -750,16 +755,12 @@ process_roles_at_scope() {
 # PIM Sync
 #------------------------------------------------------------------------------
 
-sync_pim_groups() {
-    print_info "Syncing PIM group eligibilities..."
-
-    local pim_dir="$AZURE_DIR/entra/pim"
-    ensure_dir "$pim_dir"
-
-    local groups_dir="$pim_dir/groups"
-    ensure_dir "$groups_dir"
-
-    # Try to get token from entra-audit first (has PIM permissions)
+# Get a Graph token for PIM reads. Prefers the entra-audit delegated token
+# (local runs), falls back to the az CLI token — which is app-only in CI, so
+# PIM sync there needs the Graph app roles granted to the workflow's SP:
+#   PrivilegedEligibilitySchedule.Read.AzureADGroup (PIM for groups)
+#   RoleManagement.Read.Directory (PIM for directory roles)
+get_pim_graph_token() {
     local token=""
     local entra_audit_config="$HOME/.config/entra-audit/token.json"
 
@@ -770,125 +771,242 @@ sync_pim_groups() {
 
         if [[ -n "$stored_token" ]] && [[ "$expires_on" -gt "$(date +%s)" ]]; then
             token="$stored_token"
-            print_info "  Using entra-audit token (has PIM permissions)"
+            print_info "  Using entra-audit token (has PIM permissions)" >&2
         fi
     fi
 
-    # Fall back to az CLI token (may not have PIM permissions)
     if [[ -z "$token" ]]; then
         token=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv 2>/dev/null)
         if [[ -n "$token" ]]; then
-            print_warning "  Using az CLI token (may lack PIM permissions - run './entrauling.sh login' for full PIM sync)"
+            print_warning "  Using az CLI token (PIM reads need the identity to hold PIM permissions)" >&2
         fi
     fi
 
+    echo "$token"
+}
+
+# GET a Graph collection, following @odata.nextLink pagination.
+# Prints a JSON array of all .value items; returns 1 on any error response
+# so callers can bail out before touching previously-synced files.
+graph_get_all() {
+    local token="$1"
+    local url="$2"
+    local items="[]"
+
+    while [[ -n "$url" ]]; do
+        local page
+        page=$(curl -s -H "Authorization: Bearer $token" "$url" 2>/dev/null)
+
+        if ! echo "$page" | jq -e '.value' &>/dev/null; then
+            local error_msg
+            error_msg=$(echo "$page" | jq -r '.error.message // "no response"' 2>/dev/null)
+            print_warning "  Graph request failed: $error_msg" >&2
+            print_warning "    $url" >&2
+            return 1
+        fi
+
+        items=$(echo "$page" | jq --argjson acc "$items" '$acc + .value')
+        url=$(echo "$page" | jq -r '.["@odata.nextLink"] // empty')
+    done
+
+    echo "$items"
+}
+
+# Create display-name symlinks under $3 for each .principalId in the JSON
+# array $2, pointing at the principal's ___guid.json under entra/.
+# Link depth assumes $3 is entra/pim/{groups|roles}/{name}/eligible.
+link_eligible_principals() {
+    local token="$1"
+    local principals_json="$2"
+    local eligible_dir="$3"
+
+    ensure_dir "$eligible_dir"
+
+    echo "$principals_json" | jq -r '[.[].principalId] | unique | .[]' | while read -r principal_id; do
+        [[ -z "$principal_id" ]] && continue
+
+        # Try to resolve principal name
+        local principal_info principal_name safe_principal_name
+        principal_info=$(curl -s -H "Authorization: Bearer $token" \
+            "https://graph.microsoft.com/v1.0/directoryObjects/${principal_id}" 2>/dev/null)
+        principal_name=$(echo "$principal_info" | jq -r '.displayName // .userPrincipalName // .id')
+        safe_principal_name=$(sanitize_name "$principal_name")
+
+        local principal_type
+        principal_type=$(echo "$principal_info" | jq -r '.["@odata.type"] // "unknown"' | sed 's/#microsoft.graph.//')
+
+        # Find the ___guid.json file and create symlink to it
+        local found_file=""
+        local relative_path=""
+
+        case "$principal_type" in
+            "user")
+                found_file=$(find "$AZURE_DIR/entra/users" -name "___${principal_id}.json" 2>/dev/null | head -1)
+                if [[ -n "$found_file" ]]; then
+                    local user_type=$(basename "$(dirname "$(dirname "$found_file")")")
+                    relative_path="../../../../users/$user_type/$safe_principal_name/___${principal_id}.json"
+                fi
+                ;;
+            "group")
+                found_file=$(find "$AZURE_DIR/entra/groups" -name "___${principal_id}.json" 2>/dev/null | head -1)
+                if [[ -n "$found_file" ]]; then
+                    local grp_name=$(basename "$(dirname "$found_file")")
+                    relative_path="../../../../groups/$grp_name/___${principal_id}.json"
+                fi
+                ;;
+            "servicePrincipal")
+                found_file=$(find "$AZURE_DIR/entra/service_principals" -name "___${principal_id}.json" 2>/dev/null | head -1)
+                if [[ -n "$found_file" ]]; then
+                    local sp_type=$(basename "$(dirname "$(dirname "$found_file")")")
+                    local sp_name=$(basename "$(dirname "$found_file")")
+                    relative_path="../../../../service_principals/$sp_type/$sp_name/___${principal_id}.json"
+                fi
+                ;;
+        esac
+
+        # Create symlink named by display name, pointing to ___guid.json
+        if [[ -n "$found_file" ]] && [[ -f "$found_file" ]]; then
+            ln -sf "$relative_path" "$eligible_dir/$safe_principal_name" 2>/dev/null || true
+        fi
+    done
+}
+
+sync_pim_groups() {
+    print_info "Syncing PIM group eligibilities..."
+
+    local token
+    token=$(get_pim_graph_token)
+
     if [[ -z "$token" ]]; then
-        print_warning "  Could not get Graph API token, skipping PIM sync"
+        print_warning "  Could not get Graph API token, skipping PIM group sync"
         return
     fi
 
-    # Get current user's eligible groups to discover PIM-enabled groups
-    local user_id
-    user_id=$(curl -s -H "Authorization: Bearer $token" "https://graph.microsoft.com/v1.0/me" | jq -r '.id')
+    # Discover PIM-enabled groups by querying every group for eligibility
+    # schedules. The privilegedAccess/group API requires a groupId or
+    # principalId filter, and filtering on the caller's principalId only sees
+    # the caller's own eligibilities — under app-only auth (CI) the SP has
+    # none, which left this sync silently empty.
+    local all_groups
+    if ! all_groups=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/groups?\$select=id,displayName&\$top=999"); then
+        print_warning "  Could not list groups, skipping PIM group sync"
+        return
+    fi
 
-    local user_eligible
-    user_eligible=$(curl -s -H "Authorization: Bearer $token" \
-        "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?\$filter=principalId%20eq%20%27${user_id}%27" 2>/dev/null)
+    local groups_dir="$AZURE_DIR/entra/pim/groups"
+    ensure_dir "$groups_dir"
 
-    local group_ids
-    group_ids=$(echo "$user_eligible" | jq -r '[.value[]?.groupId] | unique | .[]' 2>/dev/null)
+    local pim_group_count=0
+    while read -r group; do
+        [[ -z "$group" ]] && continue
 
-    if [[ -z "$group_ids" ]]; then
+        local group_id group_name safe_group_name group_pim_dir
+        group_id=$(echo "$group" | jq -r '.id')
+        group_name=$(echo "$group" | jq -r '.displayName // .id')
+        safe_group_name=$(sanitize_name "$group_name")
+        group_pim_dir="$groups_dir/$safe_group_name"
+
+        # Get all eligibilities for this group. A permission error aborts the
+        # whole sync so previously-synced data is left intact.
+        local eligibilities
+        if ! eligibilities=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27"); then
+            print_warning "  Aborting PIM group sync (missing PrivilegedEligibilitySchedule.Read.AzureADGroup?)"
+            return
+        fi
+
+        # Get active assignments
+        local active
+        if ! active=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27"); then
+            active="[]"
+        fi
+
+        # Not a PIM-enabled group: make sure no stale snapshot lingers
+        if [[ "$(echo "$eligibilities" | jq 'length')" == "0" ]] && [[ "$(echo "$active" | jq 'length')" == "0" ]]; then
+            rm -rf "$group_pim_dir"
+            continue
+        fi
+
+        pim_group_count=$((pim_group_count + 1))
+        rm -rf "$group_pim_dir"
+        ensure_dir "$group_pim_dir"
+
+        echo "$eligibilities" | jq '.' > "$group_pim_dir/_eligibilities.json"
+        echo "$active" | jq '.' > "$group_pim_dir/_active.json"
+
+        # Create symlinks to eligible users/groups
+        link_eligible_principals "$token" "$eligibilities" "$group_pim_dir/eligible"
+
+    done < <(echo "$all_groups" | jq -c '.[]')
+
+    if [[ "$pim_group_count" -eq 0 ]]; then
         print_warning "  No PIM-enabled groups found"
         return
     fi
 
-    # For each PIM group, get all eligibilities
-    while read -r group_id; do
-        [[ -z "$group_id" ]] && continue
+    print_success "  PIM groups synced to $groups_dir ($pim_group_count group(s))"
+}
 
-        # Get group name
-        local group_info
-        group_info=$(curl -s -H "Authorization: Bearer $token" \
-            "https://graph.microsoft.com/v1.0/groups/${group_id}?\$select=id,displayName" 2>/dev/null)
+sync_pim_roles() {
+    print_info "Syncing PIM directory role eligibilities..."
 
-        local group_name safe_group_name group_pim_dir
-        group_name=$(echo "$group_info" | jq -r '.displayName // .id')
-        safe_group_name=$(sanitize_name "$group_name")
-        group_pim_dir="$groups_dir/$safe_group_name"
-        ensure_dir "$group_pim_dir"
+    local token
+    token=$(get_pim_graph_token)
 
-        # Get all eligibilities for this group
-        local eligibilities
-        eligibilities=$(curl -s -H "Authorization: Bearer $token" \
-            "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" 2>/dev/null)
+    if [[ -z "$token" ]]; then
+        print_warning "  Could not get Graph API token, skipping PIM role sync"
+        return
+    fi
 
-        echo "$eligibilities" | jq '.value' > "$group_pim_dir/_eligibilities.json"
+    # Requires RoleManagement.Read.Directory (delegated or application)
+    local eligibilities
+    if ! eligibilities=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances"); then
+        print_warning "  Skipping PIM role sync (missing RoleManagement.Read.Directory?)"
+        return
+    fi
 
-        # Get active assignments
-        local active
-        active=$(curl -s -H "Authorization: Bearer $token" \
-            "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" 2>/dev/null)
+    local active
+    if ! active=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances"); then
+        active="[]"
+    fi
 
-        echo "$active" | jq '.value' > "$group_pim_dir/_active.json"
+    local role_defs
+    if ! role_defs=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?\$select=id,displayName"); then
+        role_defs="[]"
+    fi
+
+    # All fetches succeeded — safe to rebuild the snapshot from scratch
+    local roles_dir="$AZURE_DIR/entra/pim/roles"
+    rm -rf "$roles_dir"
+    ensure_dir "$roles_dir"
+
+    local role_ids
+    role_ids=$(jq -nr --argjson e "$eligibilities" --argjson a "$active" \
+        '[$e[].roleDefinitionId, $a[].roleDefinitionId] | unique | .[]')
+
+    local role_count=0
+    while read -r role_id; do
+        [[ -z "$role_id" ]] && continue
+
+        local role_name safe_role_name role_dir
+        role_name=$(echo "$role_defs" | jq -r --arg id "$role_id" '[.[] | select(.id == $id) | .displayName] | first // $id')
+        safe_role_name=$(sanitize_name "$role_name")
+        role_dir="$roles_dir/$safe_role_name"
+        ensure_dir "$role_dir"
+        role_count=$((role_count + 1))
+
+        local role_elig role_active
+        role_elig=$(echo "$eligibilities" | jq --arg id "$role_id" '[.[] | select(.roleDefinitionId == $id)]')
+        role_active=$(echo "$active" | jq --arg id "$role_id" '[.[] | select(.roleDefinitionId == $id)]')
+
+        echo "$role_elig" > "$role_dir/_eligibilities.json"
+        echo "$role_active" > "$role_dir/_active.json"
 
         # Create symlinks to eligible users/groups
-        local eligible_dir="$group_pim_dir/eligible"
-        ensure_dir "$eligible_dir"
+        link_eligible_principals "$token" "$role_elig" "$role_dir/eligible"
 
-        echo "$eligibilities" | jq -c '.value[]?' | while read -r elig; do
-            local principal_id member_type
-            principal_id=$(echo "$elig" | jq -r '.principalId')
-            member_type=$(echo "$elig" | jq -r '.memberType')
+    done <<< "$role_ids"
 
-            # Try to resolve principal name
-            local principal_info principal_name safe_principal_name
-            principal_info=$(curl -s -H "Authorization: Bearer $token" \
-                "https://graph.microsoft.com/v1.0/directoryObjects/${principal_id}" 2>/dev/null)
-            principal_name=$(echo "$principal_info" | jq -r '.displayName // .userPrincipalName // .id')
-            safe_principal_name=$(sanitize_name "$principal_name")
-
-            local principal_type
-            principal_type=$(echo "$principal_info" | jq -r '.["@odata.type"] // "unknown"' | sed 's/#microsoft.graph.//')
-
-            # Find the ___guid.json file and create symlink to it
-            local found_file=""
-            local relative_path=""
-
-            case "$principal_type" in
-                "user")
-                    found_file=$(find "$AZURE_DIR/entra/users" -name "___${principal_id}.json" 2>/dev/null | head -1)
-                    if [[ -n "$found_file" ]]; then
-                        local user_type=$(basename "$(dirname "$(dirname "$found_file")")")
-                        relative_path="../../../../users/$user_type/$safe_principal_name/___${principal_id}.json"
-                    fi
-                    ;;
-                "group")
-                    found_file=$(find "$AZURE_DIR/entra/groups" -name "___${principal_id}.json" 2>/dev/null | head -1)
-                    if [[ -n "$found_file" ]]; then
-                        local grp_name=$(basename "$(dirname "$found_file")")
-                        relative_path="../../../../groups/$grp_name/___${principal_id}.json"
-                    fi
-                    ;;
-                "servicePrincipal")
-                    found_file=$(find "$AZURE_DIR/entra/service_principals" -name "___${principal_id}.json" 2>/dev/null | head -1)
-                    if [[ -n "$found_file" ]]; then
-                        local sp_type=$(basename "$(dirname "$(dirname "$found_file")")")
-                        local sp_name=$(basename "$(dirname "$found_file")")
-                        relative_path="../../../../service_principals/$sp_type/$sp_name/___${principal_id}.json"
-                    fi
-                    ;;
-            esac
-
-            # Create symlink named by display name, pointing to ___guid.json
-            if [[ -n "$found_file" ]] && [[ -f "$found_file" ]]; then
-                ln -sf "$relative_path" "$eligible_dir/$safe_principal_name" 2>/dev/null || true
-            fi
-        done
-
-    done <<< "$group_ids"
-
-    print_success "  PIM groups synced to $groups_dir"
+    print_success "  PIM roles synced to $roles_dir ($role_count role(s))"
 }
 
 #------------------------------------------------------------------------------
@@ -910,7 +1028,7 @@ COMMANDS:
     subs        Sync subscriptions, resource groups, and resources
     resources   Sync only Azure resources (requires subs synced first)
     rbac        Sync RBAC assignments
-    pim         Sync PIM eligibilities
+    pim         Sync PIM eligibilities (groups + directory roles)
     help        Show this help
 
 OPTIONS:
@@ -966,6 +1084,7 @@ main() {
             [[ "$SYNC_RBAC" == "true" ]] && sync_subscription_rbac
             [[ "$SYNC_RBAC" == "true" ]] && sync_principal_roles
             sync_pim_groups
+            sync_pim_roles
             ;;
         users)
             sync_users
@@ -998,6 +1117,7 @@ main() {
             ;;
         pim)
             sync_pim_groups
+            sync_pim_roles
             ;;
         help|--help|-h)
             show_help

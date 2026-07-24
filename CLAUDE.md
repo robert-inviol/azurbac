@@ -31,7 +31,7 @@ Syncs Azure and Entra ID resources to a filesystem structure for git-based track
 - `subs` - Sync subscriptions and resource groups
 - `resources` - Sync Azure resources
 - `rbac` - Sync RBAC assignments
-- `pim` - Sync PIM eligibilities
+- `pim` - Sync PIM eligibilities (groups + directory roles)
 
 **Output Structure:**
 ```
@@ -41,7 +41,7 @@ azure/
 │   ├── groups/{displayName}/___<id>.json
 │   │   └── members/{memberName} -> symlink to ___guid.json
 │   ├── service_principals/{Type}/{displayName}/___<id>.json
-│   └── pim/groups/{groupName}/
+│   └── pim/{groups|roles}/{name}/  # _eligibilities.json, _active.json, eligible/ symlinks
 ├── subscriptions/{name}/___<id>.json
 │   ├── resource_groups/{name}/___<name>.json
 │   │   ├── roles/{roleName}/{principalName} -> symlink
