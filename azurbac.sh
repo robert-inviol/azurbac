@@ -29,6 +29,9 @@
 
 set -euo pipefail
 
+# Associative arrays (PRINCIPAL_CACHE) need bash 4+; macOS ships 3.2 at /bin/bash
+[[ ${BASH_VERSINFO[0]} -ge 4 ]] || { echo "Error: bash 4+ required (found $BASH_VERSION)" >&2; exit 1; }
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,6 +71,13 @@ sanitize_name() {
 ensure_dir() {
     local dir="$1"
     [[ -d "$dir" ]] || mkdir -p "$dir"
+}
+
+# True when a sanitized name is usable as a path component. Every rm -rf on a
+# path built from a remote-controlled displayName must check this first — an
+# empty result would target the parent dir, and "." / ".." kill the script.
+is_safe_path_component() {
+    [[ -n "$1" && "$1" != "." && "$1" != ".." ]]
 }
 
 # Check dependencies
@@ -761,8 +771,10 @@ process_roles_at_scope() {
 # Get a Graph token for PIM reads. Prefers the entra-audit delegated token
 # (local runs), falls back to the az CLI token — which is app-only in CI, so
 # PIM sync there needs the Graph app roles granted to the workflow's SP:
-#   PrivilegedEligibilitySchedule.Read.AzureADGroup (PIM for groups)
+#   PrivilegedEligibilitySchedule.Read.AzureADGroup (PIM group eligibilities)
+#   PrivilegedAssignmentSchedule.Read.AzureADGroup  (PIM group active assignments)
 #   RoleManagement.Read.Directory (PIM for directory roles)
+# plus Group.Read.All for the discovery enumeration (already required by sync_groups).
 get_pim_graph_token() {
     local token=""
     local entra_audit_config="$HOME/.config/entra-audit/token.json"
@@ -800,6 +812,10 @@ graph_get_all() {
     local permission_hint="${3:-}"
     local pages
     pages=$(mktemp)
+    # Covers error return, success return, and set -e/interrupt exits alike.
+    # RETURN traps aren't inherited by nested calls and don't outlive this
+    # function (verified), so print_warning etc. can't fire it early.
+    trap 'rm -f "$pages"' RETURN
 
     while [[ -n "$url" ]]; do
         local response http_code body
@@ -816,7 +832,6 @@ graph_get_all() {
             if [[ "$http_code" == "403" && -n "$permission_hint" ]]; then
                 print_warning "  Hint: the identity may be missing $permission_hint" >&2
             fi
-            rm -f "$pages"
             return 1
         fi
 
@@ -827,7 +842,6 @@ graph_get_all() {
     done
 
     jq -s 'add // []' "$pages"
-    rm -f "$pages"
 }
 
 # Create display-name symlinks under $3 for each .principalId in the JSON
@@ -931,24 +945,25 @@ sync_pim_groups() {
     while read -r group; do
         [[ -z "$group" ]] && continue
 
-        # PIM for Groups can't be enabled on dynamic-membership groups —
-        # skip instead of probing them twice each
-        if [[ "$(echo "$group" | jq '(.groupTypes // []) | index("DynamicMembership") != null')" == "true" ]]; then
-            continue
-        fi
-
         local group_id group_name safe_group_name group_pim_dir
         group_id=$(echo "$group" | jq -r '.id')
         group_name=$(echo "$group" | jq -r '.displayName // .id')
         safe_group_name=$(sanitize_name "$group_name")
 
         # A displayName that sanitizes to nothing (or a dot-dir) must never
-        # reach the rm -rf below
-        if [[ -z "$safe_group_name" || "$safe_group_name" == "." || "$safe_group_name" == ".." ]]; then
+        # reach an rm -rf below
+        if ! is_safe_path_component "$safe_group_name"; then
             print_warning "  Skipping group $group_id: unusable display name for a path"
             continue
         fi
         group_pim_dir="$groups_dir/$safe_group_name"
+
+        # PIM for Groups can't target dynamic-membership groups — clear any
+        # snapshot left from when the group was assigned-membership, then skip
+        if [[ "$(echo "$group" | jq '(.groupTypes // []) | index("DynamicMembership") != null')" == "true" ]]; then
+            rm -rf "$group_pim_dir"
+            continue
+        fi
 
         # Fetch BOTH schedules before touching this group's snapshot; any
         # failure aborts the whole sync so previously-synced data is left
@@ -961,7 +976,7 @@ sync_pim_groups() {
         fi
 
         local active
-        if ! active=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" "PrivilegedEligibilitySchedule.Read.AzureADGroup"); then
+        if ! active=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" "PrivilegedAssignmentSchedule.Read.AzureADGroup"); then
             print_warning "  Aborting PIM group sync (assignment schedules unreadable)"
             return
         fi
@@ -1043,7 +1058,7 @@ sync_pim_roles() {
         local role_name safe_role_name role_dir
         role_name=$(echo "$role_defs" | jq -r --arg id "$role_id" '[.[] | select(.id == $id) | .displayName] | first // $id')
         safe_role_name=$(sanitize_name "$role_name")
-        if [[ -z "$safe_role_name" || "$safe_role_name" == "." || "$safe_role_name" == ".." ]]; then
+        if ! is_safe_path_component "$safe_role_name"; then
             print_warning "  Skipping role $role_id: unusable display name for a path"
             continue
         fi
