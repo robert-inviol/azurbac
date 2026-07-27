@@ -14,7 +14,10 @@ azure/
 │   ├── users/Member/Alice/___<guid>.json
 │   ├── groups/Platform-Admins/___<guid>.json
 │   │   └── members/Alice -> ../../users/Member/Alice/___<guid>.json
-│   └── service_principals/Application/my-app/___<guid>.json
+│   ├── service_principals/Application/my-app/___<guid>.json
+│   └── pim/
+│       ├── groups/Platform-Admins/     # _eligibilities.json, _active.json, eligible/ symlinks
+│       └── roles/Global Administrator/ # _eligibilities.json, _active.json, eligible/ symlinks
 └── subscriptions/Production/
     └── resource_groups/rg-core/
         └── roles/Contributor/
