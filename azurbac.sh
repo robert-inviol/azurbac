@@ -51,6 +51,19 @@ SYNC_RESOURCES="${SYNC_RESOURCES:-true}"
 # principalId -> "type|safeName", shared across PIM link passes
 declare -A PRINCIPAL_CACHE
 
+# Set to 1 whenever a sync section aborts; main() exits non-zero so CI goes
+# red instead of committing a green build with silently-missing sections.
+SYNC_FAILED=0
+
+# Graph application permissions required by the PIM syncs. These variables
+# are the single source of truth: the 403 hints, the startup preflight, AND
+# the `permissions` subcommand all read them — so a consent request built
+# from `azurbac.sh permissions` can never drift from what the code needs.
+GRAPH_PERM_GROUP_LIST="Group.Read.All"
+GRAPH_PERM_PIM_GROUP_ELIG="PrivilegedEligibilitySchedule.Read.AzureADGroup"
+GRAPH_PERM_PIM_GROUP_ACTIVE="PrivilegedAssignmentSchedule.Read.AzureADGroup"
+GRAPH_PERM_PIM_ROLES="RoleManagement.Read.Directory"
+
 #------------------------------------------------------------------------------
 # Utility Functions
 #------------------------------------------------------------------------------
@@ -800,6 +813,42 @@ get_pim_graph_token() {
     echo "$token"
 }
 
+# Decode a JWT's payload without verification — we only read the roles claim
+# to preflight permissions; the Graph API remains the authority.
+jwt_payload() {
+    local payload
+    payload=$(echo "$1" | cut -d. -f2 | tr '_-' '/+')
+    while (( ${#payload} % 4 )); do payload+="="; done
+    echo "$payload" | base64 -d 2>/dev/null
+}
+
+# Report EVERY missing Graph app permission up-front, instead of a 20-minute
+# run aborting partway through group one naming a single permission.
+# App-only tokens list granted app roles in `roles`; delegated tokens use
+# `scp` instead — those (the entra-audit path) skip the check quietly, since
+# delegated effective rights also depend on the user's directory roles.
+preflight_graph_permissions() {
+    local token="$1"; shift
+    local payload roles perm
+    local missing=()
+
+    payload=$(jwt_payload "$token") || return 0
+    [[ -z "$payload" ]] && return 0
+    echo "$payload" | jq -e 'has("roles")' &>/dev/null || return 0
+
+    roles=$(echo "$payload" | jq -r '.roles[]?' 2>/dev/null)
+    for perm in "$@"; do
+        grep -qx "$perm" <<< "$roles" || missing+=("$perm")
+    done
+
+    if (( ${#missing[@]} )); then
+        print_warning "  App token is missing Graph permission(s): ${missing[*]}" >&2
+        print_warning "  Grant the full set from: ./azurbac.sh permissions" >&2
+        return 1
+    fi
+    return 0
+}
+
 # GET a Graph collection, following @odata.nextLink pagination.
 # Prints a JSON array of all .value items; returns 1 on any error response
 # so callers can bail out before touching previously-synced files.
@@ -924,6 +973,14 @@ sync_pim_groups() {
 
     if [[ -z "$token" ]]; then
         print_warning "  Could not get Graph API token, skipping PIM group sync"
+        SYNC_FAILED=1
+        return
+    fi
+
+    if ! preflight_graph_permissions "$token" \
+        "$GRAPH_PERM_GROUP_LIST" "$GRAPH_PERM_PIM_GROUP_ELIG" "$GRAPH_PERM_PIM_GROUP_ACTIVE"; then
+        print_warning "  Skipping PIM group sync (permissions above not granted)"
+        SYNC_FAILED=1
         return
     fi
 
@@ -933,8 +990,9 @@ sync_pim_groups() {
     # the caller's own eligibilities — under app-only auth (CI) the SP has
     # none, which left this sync silently empty.
     local all_groups
-    if ! all_groups=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/groups?\$select=id,displayName,groupTypes&\$top=999" "Group.Read.All"); then
+    if ! all_groups=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/groups?\$select=id,displayName,groupTypes&\$top=999" "$GRAPH_PERM_GROUP_LIST"); then
         print_warning "  Could not list groups, skipping PIM group sync"
+        SYNC_FAILED=1
         return
     fi
 
@@ -970,14 +1028,16 @@ sync_pim_groups() {
         # intact — in the committed diff, a silent [] from a failed fetch
         # would be indistinguishable from a real access change.
         local eligibilities
-        if ! eligibilities=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" "PrivilegedEligibilitySchedule.Read.AzureADGroup"); then
+        if ! eligibilities=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" "$GRAPH_PERM_PIM_GROUP_ELIG"); then
             print_warning "  Aborting PIM group sync (eligibility schedules unreadable)"
+            SYNC_FAILED=1
             return
         fi
 
         local active
-        if ! active=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" "PrivilegedAssignmentSchedule.Read.AzureADGroup"); then
+        if ! active=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" "$GRAPH_PERM_PIM_GROUP_ACTIVE"); then
             print_warning "  Aborting PIM group sync (assignment schedules unreadable)"
+            SYNC_FAILED=1
             return
         fi
 
@@ -1017,6 +1077,13 @@ sync_pim_roles() {
 
     if [[ -z "$token" ]]; then
         print_warning "  Could not get Graph API token, skipping PIM role sync"
+        SYNC_FAILED=1
+        return
+    fi
+
+    if ! preflight_graph_permissions "$token" "$GRAPH_PERM_PIM_ROLES"; then
+        print_warning "  Skipping PIM role sync (permissions above not granted)"
+        SYNC_FAILED=1
         return
     fi
 
@@ -1025,20 +1092,23 @@ sync_pim_roles() {
     # or GUID-name fallback would commit a wipe/rename indistinguishable
     # from a real access change.
     local eligibilities
-    if ! eligibilities=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances" "RoleManagement.Read.Directory"); then
+    if ! eligibilities=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances" "$GRAPH_PERM_PIM_ROLES"); then
         print_warning "  Skipping PIM role sync (eligibility schedules unreadable)"
+        SYNC_FAILED=1
         return
     fi
 
     local active
-    if ! active=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances" "RoleManagement.Read.Directory"); then
+    if ! active=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances" "$GRAPH_PERM_PIM_ROLES"); then
         print_warning "  Skipping PIM role sync (assignment schedules unreadable)"
+        SYNC_FAILED=1
         return
     fi
 
     local role_defs
-    if ! role_defs=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?\$select=id,displayName" "RoleManagement.Read.Directory"); then
+    if ! role_defs=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?\$select=id,displayName" "$GRAPH_PERM_PIM_ROLES"); then
         print_warning "  Skipping PIM role sync (role definitions unreadable)"
+        SYNC_FAILED=1
         return
     fi
 
@@ -1105,6 +1175,8 @@ COMMANDS:
     resources   Sync only Azure resources (requires subs synced first)
     rbac        Sync RBAC assignments
     pim         Sync PIM eligibilities (groups + directory roles)
+    permissions Print the Graph app permissions the PIM sync requires
+                (build consent requests from this, not from the docs)
     help        Show this help
 
 OPTIONS:
@@ -1195,6 +1267,18 @@ main() {
             sync_pim_groups
             sync_pim_roles
             ;;
+        permissions)
+            # Emitted from the same variables the 403 hints and preflight
+            # use — a consent request built from this output cannot drift
+            # from the code. (Base directory reads for the users/groups/sps
+            # syncs — User/Group/GroupMember/Application/Directory.Read.All —
+            # are granted at SP setup and not listed here.)
+            echo "$GRAPH_PERM_GROUP_LIST"
+            echo "$GRAPH_PERM_PIM_GROUP_ELIG"
+            echo "$GRAPH_PERM_PIM_GROUP_ACTIVE"
+            echo "$GRAPH_PERM_PIM_ROLES"
+            exit 0
+            ;;
         help|--help|-h)
             show_help
             exit 0
@@ -1207,6 +1291,10 @@ main() {
     esac
 
     echo ""
+    if [[ "$SYNC_FAILED" -ne 0 ]]; then
+        print_error "One or more sync sections aborted — their data was NOT updated (see warnings above)"
+        exit 1
+    fi
     print_success "Sync complete!"
     print_info "You can now commit changes: cd $AZURE_DIR && git add -A && git commit -m 'Azure sync $(date +%Y-%m-%d)'"
 }

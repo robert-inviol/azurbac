@@ -32,6 +32,7 @@ Syncs Azure and Entra ID resources to a filesystem structure for git-based track
 - `resources` - Sync Azure resources
 - `rbac` - Sync RBAC assignments
 - `pim` - Sync PIM eligibilities (groups + directory roles)
+- `permissions` - Print the Graph app permissions the PIM sync requires (build consent requests from this)
 
 **Output Structure:**
 ```
