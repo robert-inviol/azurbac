@@ -16,8 +16,8 @@ azure/
 │   │   └── members/Alice -> ../../users/Member/Alice/___<guid>.json
 │   ├── service_principals/Application/my-app/___<guid>.json
 │   └── pim/
-│       ├── groups/Platform-Admins/     # _eligibilities.json, _active.json, eligible/ symlinks
-│       └── roles/Global Administrator/ # _eligibilities.json, _active.json, eligible/ symlinks
+│       ├── groups/Platform-Admins/     # _eligibilities.json, _active.json, eligible/ + active/ symlinks
+│       └── roles/Global Administrator/ # _eligibilities.json, _active.json, eligible/ + active/ symlinks
 └── subscriptions/Production/
     └── resource_groups/rg-core/
         └── roles/Contributor/
@@ -51,9 +51,16 @@ git commit -m "Azure permissions snapshot $(date +%Y-%m-%d)"
 
 ## Requirements
 
+- `bash` 4+ (stock macOS ships 3.2 — `brew install bash`)
 - `az` CLI (logged in)
 - `jq`
 - `gum` (for entrauling.sh interactive mode)
+
+Running `azurbac.sh` app-only (CI) additionally needs Graph application
+permissions for the PIM sync — print the least-privileged set with
+`./azurbac.sh permissions` and build the consent request from that output.
+Until the grant is in place, set `SYNC_PIM=false` to keep the rest of the
+sync green.
 
 ## Why?
 

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# curl stub for the test harness: serves canned Graph responses keyed by
+# exact URL from the tab-separated map file named by $CURL_FIXTURES
+# (columns: url<TAB>http_status<TAB>body_file). Mimics the one invocation
+# shape azurbac.sh uses: -w '\n%{http_code}' appends the status on its own
+# line after the body. Unmapped URLs return a loud 500 so a test can never
+# silently pass against a fixture it forgot to declare.
+
+url=""
+for arg in "$@"; do
+    case "$arg" in
+        http://*|https://*) url="$arg" ;;
+    esac
+done
+
+if [[ -z "$url" || -z "${CURL_FIXTURES:-}" || ! -f "$CURL_FIXTURES" ]]; then
+    echo '{"error":{"message":"curl stub: no URL or no fixture map"}}'
+    printf '\n%s' "500"
+    exit 0
+fi
+
+while IFS=$'\t' read -r map_url status body_file; do
+    [[ "$map_url" == "$url" ]] || continue
+    cat "$body_file"
+    printf '\n%s' "$status"
+    exit 0
+done < "$CURL_FIXTURES"
+
+printf '{"error":{"message":"curl stub: unmapped URL %s"}}' "$url"
+printf '\n%s' "500"
+exit 0

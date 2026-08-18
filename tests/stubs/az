@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# az stub for the test harness: satisfies check_dependencies and hands
+# get_pim_graph_token the crafted JWT from $STUB_TOKEN.
+
+case "${1:-} ${2:-}" in
+    "account show")
+        echo '{"name":"stub-subscription"}'
+        exit 0
+        ;;
+    "account get-access-token")
+        printf '%s\n' "${STUB_TOKEN:-}"
+        exit 0
+        ;;
+esac
+exit 0
