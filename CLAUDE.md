@@ -31,7 +31,8 @@ Syncs Azure and Entra ID resources to a filesystem structure for git-based track
 - `subs` - Sync subscriptions and resource groups
 - `resources` - Sync Azure resources
 - `rbac` - Sync RBAC assignments
-- `pim` - Sync PIM eligibilities
+- `pim` - Sync PIM eligibilities (groups + directory roles)
+- `permissions` - Print the Graph app permissions the PIM sync requires (build consent requests from this)
 
 **Output Structure:**
 ```
@@ -41,7 +42,7 @@ azure/
 │   ├── groups/{displayName}/___<id>.json
 │   │   └── members/{memberName} -> symlink to ___guid.json
 │   ├── service_principals/{Type}/{displayName}/___<id>.json
-│   └── pim/groups/{groupName}/
+│   └── pim/{groups|roles}/{name}/  # _eligibilities.json, _active.json, eligible/ + active/ symlinks
 ├── subscriptions/{name}/___<id>.json
 │   ├── resource_groups/{name}/___<name>.json
 │   │   ├── roles/{roleName}/{principalName} -> symlink
@@ -88,7 +89,7 @@ The `.devcontainer` configuration provides a ready-to-use environment with all d
 
 For `azurbac.sh`:
 - `AZURE_DIR` - Base directory (default: ./azure)
-- `SYNC_USERS`, `SYNC_GROUPS`, `SYNC_SERVICE_PRINCIPALS`, `SYNC_SUBSCRIPTIONS`, `SYNC_RBAC`, `SYNC_RESOURCES` - Enable/disable specific sync operations (default: true)
+- `SYNC_USERS`, `SYNC_GROUPS`, `SYNC_SERVICE_PRINCIPALS`, `SYNC_SUBSCRIPTIONS`, `SYNC_RBAC`, `SYNC_RESOURCES`, `SYNC_PIM` - Enable/disable specific sync operations (default: true)
 
 ## Common Tasks
 

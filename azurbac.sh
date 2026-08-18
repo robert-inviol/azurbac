@@ -13,6 +13,13 @@
 #         roles/{roleName}/{scopeName} -> symlink to subscription/RG/resource ___*.json
 #       service_principals/{Application|ManagedIdentity|...}/{displayName}/___{id}.json
 #         roles/{roleName}/{scopeName} -> symlink to subscription/RG/resource ___*.json
+#       pim/
+#         groups/{groupName}/_eligibilities.json + _active.json
+#           eligible/{principalName} -> symlink to entra ___guid.json
+#           active/{principalName} -> symlink to entra ___guid.json
+#         roles/{roleName}/_eligibilities.json + _active.json
+#           eligible/{principalName} -> symlink to entra ___guid.json
+#           active/{principalName} -> symlink to entra ___guid.json
 #     subscriptions/{name}/___{id}.json
 #       resource_groups/{name}/___{name}.json
 #         roles/{roleName}/{principalName} -> symlink to entra ___guid.json
@@ -23,6 +30,9 @@
 #
 
 set -euo pipefail
+
+# Associative arrays (PRINCIPAL_CACHE) need bash 4+; macOS ships 3.2 at /bin/bash
+[[ ${BASH_VERSINFO[0]} -ge 4 ]] || { echo "Error: bash 4+ required (found $BASH_VERSION)" >&2; exit 1; }
 
 # Colors
 RED='\033[0;31m'
@@ -39,6 +49,27 @@ SYNC_SERVICE_PRINCIPALS="${SYNC_SERVICE_PRINCIPALS:-true}"
 SYNC_SUBSCRIPTIONS="${SYNC_SUBSCRIPTIONS:-true}"
 SYNC_RBAC="${SYNC_RBAC:-true}"
 SYNC_RESOURCES="${SYNC_RESOURCES:-true}"
+SYNC_PIM="${SYNC_PIM:-true}"
+
+# principalId -> "type|safeName", shared across PIM link passes
+declare -A PRINCIPAL_CACHE
+
+# Set to 1 whenever a sync section aborts; main() exits non-zero so CI goes
+# red instead of committing a green build with silently-missing sections.
+SYNC_FAILED=0
+
+# Graph application permissions required by the PIM syncs. These variables
+# are the single source of truth: the 403 hints, the startup preflight, AND
+# the `permissions` subcommand all read them — so a consent request built
+# from `azurbac.sh permissions` can never drift from what the code needs.
+# Each is the least-privileged application permission for its call(s);
+# documented supersets (RoleManagement.Read.All, ReadWrite variants, ...)
+# also work — the preflight is advisory, the Graph API is the authority.
+GRAPH_PERM_DIR_READ="Directory.Read.All"  # GET /groups, /directoryObjects/{id}, roleDefinitions
+GRAPH_PERM_PIM_GROUP_ELIG="PrivilegedEligibilitySchedule.Read.AzureADGroup"
+GRAPH_PERM_PIM_GROUP_ACTIVE="PrivilegedAssignmentSchedule.Read.AzureADGroup"
+GRAPH_PERM_PIM_ROLE_ELIG="RoleEligibilitySchedule.Read.Directory"
+GRAPH_PERM_PIM_ROLE_ACTIVE="RoleAssignmentSchedule.Read.Directory"
 
 #------------------------------------------------------------------------------
 # Utility Functions
@@ -60,6 +91,13 @@ sanitize_name() {
 ensure_dir() {
     local dir="$1"
     [[ -d "$dir" ]] || mkdir -p "$dir"
+}
+
+# True when a sanitized name is usable as a path component. Every rm -rf on a
+# path built from a remote-controlled displayName must check this first — an
+# empty result would target the parent dir, and "." / ".." kill the script.
+is_safe_path_component() {
+    [[ -n "$1" && "$1" != "." && "$1" != ".." ]]
 }
 
 # Check dependencies
@@ -750,16 +788,12 @@ process_roles_at_scope() {
 # PIM Sync
 #------------------------------------------------------------------------------
 
-sync_pim_groups() {
-    print_info "Syncing PIM group eligibilities..."
-
-    local pim_dir="$AZURE_DIR/entra/pim"
-    ensure_dir "$pim_dir"
-
-    local groups_dir="$pim_dir/groups"
-    ensure_dir "$groups_dir"
-
-    # Try to get token from entra-audit first (has PIM permissions)
+# Get a Graph token for PIM reads. Prefers the entra-audit delegated token
+# (local runs), falls back to the az CLI token — which is app-only in CI, so
+# PIM sync there needs the Graph app roles granted to the workflow's SP.
+# The full set is the GRAPH_PERM_* variables above — print it with
+# `./azurbac.sh permissions` and build consent requests from that output.
+get_pim_graph_token() {
     local token=""
     local entra_audit_config="$HOME/.config/entra-audit/token.json"
 
@@ -770,125 +804,458 @@ sync_pim_groups() {
 
         if [[ -n "$stored_token" ]] && [[ "$expires_on" -gt "$(date +%s)" ]]; then
             token="$stored_token"
-            print_info "  Using entra-audit token (has PIM permissions)"
+            print_info "  Using entra-audit token (has PIM permissions)" >&2
         fi
     fi
 
-    # Fall back to az CLI token (may not have PIM permissions)
     if [[ -z "$token" ]]; then
         token=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv 2>/dev/null)
         if [[ -n "$token" ]]; then
-            print_warning "  Using az CLI token (may lack PIM permissions - run './entrauling.sh login' for full PIM sync)"
+            print_warning "  Using az CLI token (PIM reads need the identity to hold PIM permissions)" >&2
         fi
     fi
 
+    echo "$token"
+}
+
+# Decode a JWT's payload without verification — we only read the roles claim
+# to preflight permissions; the Graph API remains the authority.
+jwt_payload() {
+    local payload
+    payload=$(echo "$1" | cut -d. -f2 | tr '_-' '/+')
+    while (( ${#payload} % 4 )); do payload+="="; done
+    echo "$payload" | base64 -d 2>/dev/null
+}
+
+# Report EVERY missing Graph app permission up-front, instead of a 20-minute
+# run aborting partway through group one naming a single permission.
+# ADVISORY ONLY: it checks for the recommended least-privileged set, but
+# documented supersets (RoleManagement.Read.All, Directory.Read.All for
+# roleDefinitions, ReadWrite variants) also satisfy these calls — so a miss
+# here warns and proceeds, and the Graph API's own 403 is what aborts.
+# App-only tokens list granted app roles in `roles`; delegated tokens use
+# `scp` instead — those (the entra-audit path) skip the check quietly, since
+# delegated effective rights also depend on the user's directory roles.
+preflight_graph_permissions() {
+    local token="$1"; shift
+    local payload roles perm
+    local missing=()
+
+    payload=$(jwt_payload "$token") || return 0
+    [[ -z "$payload" ]] && return 0
+    echo "$payload" | jq -e 'has("roles")' &>/dev/null || return 0
+
+    roles=$(echo "$payload" | jq -r '.roles[]?' 2>/dev/null)
+    for perm in "$@"; do
+        grep -qxF "$perm" <<< "$roles" || missing+=("$perm")
+    done
+
+    if (( ${#missing[@]} )); then
+        print_warning "  App token lacks recommended Graph permission(s): ${missing[*]}" >&2
+        print_warning "  Proceeding anyway — supersets also work and the API is the authority." >&2
+        print_warning "  Least-privileged grant list: ./azurbac.sh permissions" >&2
+    fi
+    return 0
+}
+
+# GET a Graph collection, following @odata.nextLink pagination.
+# Prints a JSON array of all .value items; returns 1 on any error response
+# so callers can bail out before touching previously-synced files.
+# curl --retry absorbs transient 429/503 throttling (honouring Retry-After);
+# $3, if set, names a permission to hint at — printed only on an actual 403
+# so throttling is never misreported as a consent problem.
+graph_get_all() {
+    local token="$1"
+    local url="$2"
+    local permission_hint="${3:-}"
+    local pages
+    pages=$(mktemp)
+    # Covers error and success returns. RETURN traps aren't inherited by
+    # nested calls and don't outlive this function, so print_warning etc.
+    # can't fire it early. They do NOT fire on set -e shell exit or on
+    # SIGINT/SIGTERM — a cancelled run can leak the temp file; accepted.
+    trap 'rm -f "$pages"' RETURN
+
+    while [[ -n "$url" ]]; do
+        local response http_code body
+        response=$(curl -s --retry 4 --retry-max-time 300 -w $'\n%{http_code}' \
+            -H "Authorization: Bearer $token" "$url" 2>/dev/null) || true
+        http_code="${response##*$'\n'}"
+        body="${response%$'\n'*}"
+
+        if [[ "$http_code" != "200" ]] || ! echo "$body" | jq -e '.value' &>/dev/null; then
+            local error_msg
+            error_msg=$(echo "$body" | jq -r '.error.message // "no response"' 2>/dev/null)
+            print_warning "  Graph request failed (HTTP ${http_code:-?}): $error_msg" >&2
+            print_warning "    $url" >&2
+            if [[ "$http_code" == "403" && -n "$permission_hint" ]]; then
+                print_warning "  Hint: the identity may be missing $permission_hint" >&2
+            fi
+            return 1
+        fi
+
+        # Accumulate pages on disk — an argv-passed accumulator is
+        # ARG_MAX-bound and re-serialised per page
+        echo "$body" | jq '.value' >> "$pages"
+        url=$(echo "$body" | jq -r '.["@odata.nextLink"] // empty')
+    done
+
+    jq -s 'add // []' "$pages"
+}
+
+# GET a single Graph object — graph_get_all's single-object sibling, with
+# identical failure handling: prints the object JSON on 200, returns 1 on
+# anything else (warning with status + URL, permission hint only on 403).
+graph_get_one() {
+    local token="$1"
+    local url="$2"
+    local permission_hint="${3:-}"
+
+    local response http_code body
+    response=$(curl -s --retry 4 --retry-max-time 300 -w $'\n%{http_code}' \
+        -H "Authorization: Bearer $token" "$url" 2>/dev/null) || true
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+
+    if [[ "$http_code" != "200" ]] || ! echo "$body" | jq -e 'has("id")' &>/dev/null; then
+        local error_msg
+        error_msg=$(echo "$body" | jq -r '.error.message // "no response"' 2>/dev/null)
+        print_warning "  Graph request failed (HTTP ${http_code:-?}): $error_msg" >&2
+        print_warning "    $url" >&2
+        if [[ "$http_code" == "403" && -n "$permission_hint" ]]; then
+            print_warning "  Hint: the identity may be missing $permission_hint" >&2
+        fi
+        return 1
+    fi
+
+    echo "$body"
+}
+
+# Create display-name symlinks under $3 for each .principalId in the JSON
+# array $2, pointing at the principal's ___guid.json under entra/.
+# Link depth assumes $3 is entra/pim/{groups|roles}/{name}/{eligible|active}.
+# Returns 1 (leaving the partial symlink set in place) if any principal
+# lookup fails — callers must treat that as a sync abort, not success.
+link_eligible_principals() {
+    local token="$1"
+    local principals_json="$2"
+    local eligible_dir="$3"
+
+    # No principals — don't leave an empty eligible/ dir behind
+    [[ "$(echo "$principals_json" | jq 'length')" == "0" ]] && return 0
+
+    ensure_dir "$eligible_dir"
+
+    while read -r principal_id; do
+        [[ -z "$principal_id" ]] && continue
+
+        # Resolve principal name+type, cached — the same principal is
+        # typically eligible in many groups/roles
+        local principal_info principal_name safe_principal_name principal_type
+        if [[ -n "${PRINCIPAL_CACHE[$principal_id]:-}" ]]; then
+            principal_type="${PRINCIPAL_CACHE[$principal_id]%%|*}"
+            safe_principal_name="${PRINCIPAL_CACHE[$principal_id]#*|}"
+        else
+            if ! principal_info=$(graph_get_one "$token" \
+                "https://graph.microsoft.com/v1.0/directoryObjects/${principal_id}" "$GRAPH_PERM_DIR_READ"); then
+                print_warning "  Could not resolve principal $principal_id" >&2
+                return 1
+            fi
+            principal_name=$(echo "$principal_info" | jq -r '.displayName // .userPrincipalName // .id')
+            safe_principal_name=$(sanitize_name "$principal_name")
+            principal_type=$(echo "$principal_info" | jq -r '.["@odata.type"] // "unknown"' | sed 's/#microsoft.graph.//')
+            # Cache successes only — a cached failure would poison this
+            # principal across every group and role for the rest of the run
+            PRINCIPAL_CACHE[$principal_id]="${principal_type}|${safe_principal_name}"
+        fi
+
+        if ! is_safe_path_component "$safe_principal_name"; then
+            print_warning "  Skipping principal $principal_id: unusable display name for a path"
+            continue
+        fi
+
+        # Find the ___guid.json file and create symlink to it.
+        # find exits non-zero when the tree doesn't exist yet (e.g. a
+        # standalone `pim` run before users/groups are synced) — with
+        # pipefail that would silently kill the script.
+        local found_file=""
+        local relative_path=""
+
+        case "$principal_type" in
+            "user")
+                found_file=$(find "$AZURE_DIR/entra/users" -name "___${principal_id}.json" 2>/dev/null | head -1) || true
+                if [[ -n "$found_file" ]]; then
+                    local user_type=$(basename "$(dirname "$(dirname "$found_file")")")
+                    relative_path="../../../../users/$user_type/$safe_principal_name/___${principal_id}.json"
+                fi
+                ;;
+            "group")
+                found_file=$(find "$AZURE_DIR/entra/groups" -name "___${principal_id}.json" 2>/dev/null | head -1) || true
+                if [[ -n "$found_file" ]]; then
+                    local grp_name=$(basename "$(dirname "$found_file")")
+                    relative_path="../../../../groups/$grp_name/___${principal_id}.json"
+                fi
+                ;;
+            "servicePrincipal")
+                found_file=$(find "$AZURE_DIR/entra/service_principals" -name "___${principal_id}.json" 2>/dev/null | head -1) || true
+                if [[ -n "$found_file" ]]; then
+                    local sp_type=$(basename "$(dirname "$(dirname "$found_file")")")
+                    local sp_name=$(basename "$(dirname "$found_file")")
+                    relative_path="../../../../service_principals/$sp_type/$sp_name/___${principal_id}.json"
+                fi
+                ;;
+        esac
+
+        # Create symlink named by display name, pointing to ___guid.json
+        if [[ -n "$found_file" ]] && [[ -f "$found_file" ]]; then
+            ln -sf "$relative_path" "$eligible_dir/$safe_principal_name" 2>/dev/null || true
+        fi
+    done < <(echo "$principals_json" | jq -r '[.[].principalId] | unique | .[]')
+}
+
+sync_pim_groups() {
+    print_info "Syncing PIM group eligibilities..."
+
+    local token
+    token=$(get_pim_graph_token)
+
     if [[ -z "$token" ]]; then
-        print_warning "  Could not get Graph API token, skipping PIM sync"
+        print_warning "  Could not get Graph API token, skipping PIM group sync"
+        SYNC_FAILED=1
         return
     fi
 
-    # Get current user's eligible groups to discover PIM-enabled groups
-    local user_id
-    user_id=$(curl -s -H "Authorization: Bearer $token" "https://graph.microsoft.com/v1.0/me" | jq -r '.id')
+    preflight_graph_permissions "$token" \
+        "$GRAPH_PERM_DIR_READ" "$GRAPH_PERM_PIM_GROUP_ELIG" "$GRAPH_PERM_PIM_GROUP_ACTIVE"
 
-    local user_eligible
-    user_eligible=$(curl -s -H "Authorization: Bearer $token" \
-        "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?\$filter=principalId%20eq%20%27${user_id}%27" 2>/dev/null)
+    # Discover PIM-enabled groups by querying every group for eligibility
+    # schedules. The privilegedAccess/group API requires a groupId or
+    # principalId filter, and filtering on the caller's principalId only sees
+    # the caller's own eligibilities — under app-only auth (CI) the SP has
+    # none, which left this sync silently empty.
+    local all_groups
+    if ! all_groups=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/groups?\$select=id,displayName,groupTypes&\$top=999" "$GRAPH_PERM_DIR_READ"); then
+        print_warning "  Could not list groups, skipping PIM group sync"
+        SYNC_FAILED=1
+        return
+    fi
 
-    local group_ids
-    group_ids=$(echo "$user_eligible" | jq -r '[.value[]?.groupId] | unique | .[]' 2>/dev/null)
+    local groups_dir="$AZURE_DIR/entra/pim/groups"
+    ensure_dir "$groups_dir"
 
-    if [[ -z "$group_ids" ]]; then
+    # Safe names claimed this run — detects sanitize_name collisions (so a
+    # second "Ops|Team" can't rm -rf the first's fresh snapshot) and drives
+    # the stale-dir pruning below (deleted/renamed groups leave no orphans)
+    local -A visited_group_dirs=()
+
+    local pim_group_count=0
+    while read -r group; do
+        [[ -z "$group" ]] && continue
+
+        local group_id group_name safe_group_name group_pim_dir
+        group_id=$(echo "$group" | jq -r '.id')
+        group_name=$(echo "$group" | jq -r '.displayName // .id')
+        safe_group_name=$(sanitize_name "$group_name")
+
+        # A displayName that sanitizes to nothing (or a dot-dir) must never
+        # reach an rm -rf below
+        if ! is_safe_path_component "$safe_group_name"; then
+            print_warning "  Skipping group $group_id: unusable display name for a path"
+            continue
+        fi
+        if [[ -n "${visited_group_dirs[$safe_group_name]:-}" ]]; then
+            print_warning "  Name collision on '$safe_group_name': using '${safe_group_name}___${group_id}' for $group_id"
+            safe_group_name="${safe_group_name}___${group_id}"
+        fi
+        visited_group_dirs[$safe_group_name]=1
+        group_pim_dir="$groups_dir/$safe_group_name"
+
+        # PIM for Groups can't target dynamic-membership groups — clear any
+        # snapshot left from when the group was assigned-membership, then skip
+        if [[ "$(echo "$group" | jq '(.groupTypes // []) | index("DynamicMembership") != null')" == "true" ]]; then
+            rm -rf "$group_pim_dir"
+            continue
+        fi
+
+        # Fetch BOTH schedules before touching this group's snapshot; any
+        # failure aborts the whole sync so previously-synced data is left
+        # intact — in the committed diff, a silent [] from a failed fetch
+        # would be indistinguishable from a real access change.
+        local eligibilities
+        if ! eligibilities=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" "$GRAPH_PERM_PIM_GROUP_ELIG"); then
+            print_warning "  Aborting PIM group sync (eligibility schedules unreadable)"
+            SYNC_FAILED=1
+            return
+        fi
+
+        local active
+        if ! active=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" "$GRAPH_PERM_PIM_GROUP_ACTIVE"); then
+            print_warning "  Aborting PIM group sync (assignment schedules unreadable)"
+            SYNC_FAILED=1
+            return
+        fi
+
+        # Not a PIM-enabled group: make sure no stale snapshot lingers
+        if [[ "$(echo "$eligibilities" | jq 'length')" == "0" ]] && [[ "$(echo "$active" | jq 'length')" == "0" ]]; then
+            rm -rf "$group_pim_dir"
+            continue
+        fi
+
+        pim_group_count=$((pim_group_count + 1))
+        rm -rf "$group_pim_dir"
+        ensure_dir "$group_pim_dir"
+
+        # sort_by(.id): Graph doesn't guarantee collection order, and the
+        # whole point of the snapshot is a meaningful git diff
+        echo "$eligibilities" | jq 'sort_by(.id)' > "$group_pim_dir/_eligibilities.json"
+        echo "$active" | jq 'sort_by(.id)' > "$group_pim_dir/_active.json"
+
+        # Folder views: eligible/ and active/ symlinks to the principals.
+        # A failed principal lookup aborts the sync — a silently missing
+        # symlink would read as an access change in the committed diff.
+        if ! link_eligible_principals "$token" "$eligibilities" "$group_pim_dir/eligible" ||
+           ! link_eligible_principals "$token" "$active" "$group_pim_dir/active"; then
+            print_warning "  Aborting PIM group sync (principal resolution failed)"
+            SYNC_FAILED=1
+            return
+        fi
+
+    done < <(echo "$all_groups" | jq -c '.[]')
+
+    # Prune dirs for groups no longer in the enumeration — a deleted or
+    # renamed group would otherwise leave its old snapshot behind forever.
+    # Only reached after the loop completed, so every live group is visited.
+    local existing_dir existing_name
+    for existing_dir in "$groups_dir"/*/; do
+        [[ -d "$existing_dir" ]] || continue
+        existing_name=$(basename "$existing_dir")
+        if [[ -z "${visited_group_dirs[$existing_name]:-}" ]]; then
+            print_info "  Pruning stale group snapshot: $existing_name"
+            rm -rf "$existing_dir"
+        fi
+    done
+
+    if [[ "$pim_group_count" -eq 0 ]]; then
         print_warning "  No PIM-enabled groups found"
         return
     fi
 
-    # For each PIM group, get all eligibilities
-    while read -r group_id; do
-        [[ -z "$group_id" ]] && continue
+    print_success "  PIM groups synced to $groups_dir ($pim_group_count group(s))"
+}
 
-        # Get group name
-        local group_info
-        group_info=$(curl -s -H "Authorization: Bearer $token" \
-            "https://graph.microsoft.com/v1.0/groups/${group_id}?\$select=id,displayName" 2>/dev/null)
+sync_pim_roles() {
+    print_info "Syncing PIM directory role eligibilities..."
 
-        local group_name safe_group_name group_pim_dir
-        group_name=$(echo "$group_info" | jq -r '.displayName // .id')
-        safe_group_name=$(sanitize_name "$group_name")
-        group_pim_dir="$groups_dir/$safe_group_name"
-        ensure_dir "$group_pim_dir"
+    local token
+    token=$(get_pim_graph_token)
 
-        # Get all eligibilities for this group
-        local eligibilities
-        eligibilities=$(curl -s -H "Authorization: Bearer $token" \
-            "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" 2>/dev/null)
+    if [[ -z "$token" ]]; then
+        print_warning "  Could not get Graph API token, skipping PIM role sync"
+        SYNC_FAILED=1
+        return
+    fi
 
-        echo "$eligibilities" | jq '.value' > "$group_pim_dir/_eligibilities.json"
+    preflight_graph_permissions "$token" \
+        "$GRAPH_PERM_DIR_READ" "$GRAPH_PERM_PIM_ROLE_ELIG" "$GRAPH_PERM_PIM_ROLE_ACTIVE"
 
-        # Get active assignments
-        local active
-        active=$(curl -s -H "Authorization: Bearer $token" \
-            "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances?\$filter=groupId%20eq%20%27${group_id}%27" 2>/dev/null)
+    # ALL three fetches must succeed before the snapshot is rebuilt — a []
+    # or GUID-name fallback would commit a wipe/rename indistinguishable
+    # from a real access change.
+    local eligibilities
+    if ! eligibilities=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances" "$GRAPH_PERM_PIM_ROLE_ELIG"); then
+        print_warning "  Skipping PIM role sync (eligibility schedules unreadable)"
+        SYNC_FAILED=1
+        return
+    fi
 
-        echo "$active" | jq '.value' > "$group_pim_dir/_active.json"
+    local active
+    if ! active=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances" "$GRAPH_PERM_PIM_ROLE_ACTIVE"); then
+        print_warning "  Skipping PIM role sync (assignment schedules unreadable)"
+        SYNC_FAILED=1
+        return
+    fi
 
-        # Create symlinks to eligible users/groups
-        local eligible_dir="$group_pim_dir/eligible"
-        ensure_dir "$eligible_dir"
+    local role_defs
+    if ! role_defs=$(graph_get_all "$token" "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?\$select=id,displayName" "$GRAPH_PERM_DIR_READ"); then
+        print_warning "  Skipping PIM role sync (role definitions unreadable)"
+        SYNC_FAILED=1
+        return
+    fi
 
-        echo "$eligibilities" | jq -c '.value[]?' | while read -r elig; do
-            local principal_id member_type
-            principal_id=$(echo "$elig" | jq -r '.principalId')
-            member_type=$(echo "$elig" | jq -r '.memberType')
+    # Build the new tree in a sibling temp dir and swap it in only when the
+    # whole rebuild succeeded — an abort mid-loop (e.g. a principal lookup
+    # failing) must leave the previous snapshot untouched, not truncated.
+    # Sibling (not /tmp) so the mv is same-filesystem; relative symlinks are
+    # depth-correct once swapped into place.
+    local roles_dir="$AZURE_DIR/entra/pim/roles"
+    ensure_dir "$AZURE_DIR/entra/pim"
+    # RETURN traps don't fire on SIGINT/SIGTERM, so a cancelled run can
+    # leave a temp tree behind — sweep leftovers before starting
+    rm -rf "$AZURE_DIR/entra/pim/".roles-tmp.*
+    local roles_tmp
+    roles_tmp=$(mktemp -d "$AZURE_DIR/entra/pim/.roles-tmp.XXXXXX")
+    # No RETURN trap here: unlike in graph_get_all (which runs in a command
+    # substitution subshell), a trap set in this function would outlive it
+    # and re-fire on main's return. The one abort path below cleans up
+    # explicitly; anything harder (set -e, signals) is caught by the sweep.
 
-            # Try to resolve principal name
-            local principal_info principal_name safe_principal_name
-            principal_info=$(curl -s -H "Authorization: Bearer $token" \
-                "https://graph.microsoft.com/v1.0/directoryObjects/${principal_id}" 2>/dev/null)
-            principal_name=$(echo "$principal_info" | jq -r '.displayName // .userPrincipalName // .id')
-            safe_principal_name=$(sanitize_name "$principal_name")
+    # Pipe (not --argjson): argv-passed accumulators are ARG_MAX-bound
+    local role_ids
+    role_ids=$(printf '%s\n%s\n' "$eligibilities" "$active" \
+        | jq -rs 'add | map(.roleDefinitionId) | unique | .[]')
 
-            local principal_type
-            principal_type=$(echo "$principal_info" | jq -r '.["@odata.type"] // "unknown"' | sed 's/#microsoft.graph.//')
+    local -A visited_role_dirs=()
+    local role_count=0
+    while read -r role_id; do
+        [[ -z "$role_id" ]] && continue
 
-            # Find the ___guid.json file and create symlink to it
-            local found_file=""
-            local relative_path=""
+        local role_name safe_role_name role_dir
+        role_name=$(echo "$role_defs" | jq -r --arg id "$role_id" '[.[] | select(.id == $id) | .displayName] | first // $id')
+        safe_role_name=$(sanitize_name "$role_name")
+        if ! is_safe_path_component "$safe_role_name"; then
+            print_warning "  Skipping role $role_id: unusable display name for a path"
+            continue
+        fi
+        if [[ -n "${visited_role_dirs[$safe_role_name]:-}" ]]; then
+            print_warning "  Name collision on '$safe_role_name': using '${safe_role_name}___${role_id}' for $role_id"
+            safe_role_name="${safe_role_name}___${role_id}"
+        fi
+        visited_role_dirs[$safe_role_name]=1
+        role_dir="$roles_tmp/$safe_role_name"
+        ensure_dir "$role_dir"
+        role_count=$((role_count + 1))
 
-            case "$principal_type" in
-                "user")
-                    found_file=$(find "$AZURE_DIR/entra/users" -name "___${principal_id}.json" 2>/dev/null | head -1)
-                    if [[ -n "$found_file" ]]; then
-                        local user_type=$(basename "$(dirname "$(dirname "$found_file")")")
-                        relative_path="../../../../users/$user_type/$safe_principal_name/___${principal_id}.json"
-                    fi
-                    ;;
-                "group")
-                    found_file=$(find "$AZURE_DIR/entra/groups" -name "___${principal_id}.json" 2>/dev/null | head -1)
-                    if [[ -n "$found_file" ]]; then
-                        local grp_name=$(basename "$(dirname "$found_file")")
-                        relative_path="../../../../groups/$grp_name/___${principal_id}.json"
-                    fi
-                    ;;
-                "servicePrincipal")
-                    found_file=$(find "$AZURE_DIR/entra/service_principals" -name "___${principal_id}.json" 2>/dev/null | head -1)
-                    if [[ -n "$found_file" ]]; then
-                        local sp_type=$(basename "$(dirname "$(dirname "$found_file")")")
-                        local sp_name=$(basename "$(dirname "$found_file")")
-                        relative_path="../../../../service_principals/$sp_type/$sp_name/___${principal_id}.json"
-                    fi
-                    ;;
-            esac
+        # NOTE: grouping by roleDefinitionId flattens directoryScopeId — an
+        # AU- or app-scoped eligibility lands in the same directory as a
+        # tenant-wide one. The scope survives in the JSON below; check it
+        # before reading the eligible/ folder view as tenant-wide.
+        local role_elig role_active
+        role_elig=$(echo "$eligibilities" | jq --arg id "$role_id" '[.[] | select(.roleDefinitionId == $id)] | sort_by(.id)')
+        role_active=$(echo "$active" | jq --arg id "$role_id" '[.[] | select(.roleDefinitionId == $id)] | sort_by(.id)')
 
-            # Create symlink named by display name, pointing to ___guid.json
-            if [[ -n "$found_file" ]] && [[ -f "$found_file" ]]; then
-                ln -sf "$relative_path" "$eligible_dir/$safe_principal_name" 2>/dev/null || true
-            fi
-        done
+        echo "$role_elig" > "$role_dir/_eligibilities.json"
+        echo "$role_active" > "$role_dir/_active.json"
 
-    done <<< "$group_ids"
+        # Folder views: eligible/ and active/ symlinks to the principals
+        if ! link_eligible_principals "$token" "$role_elig" "$role_dir/eligible" ||
+           ! link_eligible_principals "$token" "$role_active" "$role_dir/active"; then
+            print_warning "  Aborting PIM role sync (principal resolution failed)"
+            SYNC_FAILED=1
+            rm -rf "$roles_tmp"
+            return
+        fi
 
-    print_success "  PIM groups synced to $groups_dir"
+    done <<< "$role_ids"
+
+    rm -rf "$roles_dir"
+    mv "$roles_tmp" "$roles_dir"
+
+    if [[ "$role_count" -eq 0 ]]; then
+        print_warning "  No PIM-managed directory roles found"
+        return
+    fi
+
+    print_success "  PIM roles synced to $roles_dir ($role_count role(s))"
 }
 
 #------------------------------------------------------------------------------
@@ -910,7 +1277,9 @@ COMMANDS:
     subs        Sync subscriptions, resource groups, and resources
     resources   Sync only Azure resources (requires subs synced first)
     rbac        Sync RBAC assignments
-    pim         Sync PIM eligibilities
+    pim         Sync PIM eligibilities (groups + directory roles)
+    permissions Print the Graph app permissions the PIM sync requires
+                (build consent requests from this, not from the docs)
     help        Show this help
 
 OPTIONS:
@@ -924,6 +1293,8 @@ ENVIRONMENT VARIABLES:
     SYNC_SUBSCRIPTIONS      Sync subs/RGs (default: true)
     SYNC_RBAC               Sync RBAC (default: true)
     SYNC_RESOURCES          Sync Azure resources (default: true)
+    SYNC_PIM                Sync PIM eligibilities (default: true; set false
+                            until the 'permissions' grant is in place)
 
 EXAMPLES:
     azurbac.sh                    # Full sync
@@ -950,6 +1321,27 @@ main() {
         esac
     done
 
+    # Informational commands run before dependency checks and side effects:
+    # an admin building a consent request needs neither az nor a login, and
+    # the output must be clean, pipeable stdout (no banner, no mkdir).
+    case "$command" in
+        permissions)
+            # Emitted from the same variables the 403 hints and preflight
+            # use — a consent request built from this output cannot drift
+            # from the code.
+            echo "$GRAPH_PERM_DIR_READ"
+            echo "$GRAPH_PERM_PIM_GROUP_ELIG"
+            echo "$GRAPH_PERM_PIM_GROUP_ACTIVE"
+            echo "$GRAPH_PERM_PIM_ROLE_ELIG"
+            echo "$GRAPH_PERM_PIM_ROLE_ACTIVE"
+            exit 0
+            ;;
+        help|--help|-h)
+            show_help
+            exit 0
+            ;;
+    esac
+
     check_dependencies
 
     print_info "Azure Sync - Base directory: $AZURE_DIR"
@@ -965,7 +1357,8 @@ main() {
             [[ "$SYNC_SUBSCRIPTIONS" == "true" ]] && sync_subscriptions
             [[ "$SYNC_RBAC" == "true" ]] && sync_subscription_rbac
             [[ "$SYNC_RBAC" == "true" ]] && sync_principal_roles
-            sync_pim_groups
+            [[ "$SYNC_PIM" == "true" ]] && sync_pim_groups
+            [[ "$SYNC_PIM" == "true" ]] && sync_pim_roles
             ;;
         users)
             sync_users
@@ -998,10 +1391,7 @@ main() {
             ;;
         pim)
             sync_pim_groups
-            ;;
-        help|--help|-h)
-            show_help
-            exit 0
+            sync_pim_roles
             ;;
         *)
             print_error "Unknown command: $command"
@@ -1011,6 +1401,10 @@ main() {
     esac
 
     echo ""
+    if [[ "$SYNC_FAILED" -ne 0 ]]; then
+        print_error "One or more sync sections aborted — their data was NOT updated (see warnings above)"
+        exit 1
+    fi
     print_success "Sync complete!"
     print_info "You can now commit changes: cd $AZURE_DIR && git add -A && git commit -m 'Azure sync $(date +%Y-%m-%d)'"
 }
